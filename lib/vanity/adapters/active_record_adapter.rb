@@ -3,7 +3,7 @@ module Vanity
     class << self
       # Creates new ActiveRecord connection and returns ActiveRecordAdapter.
       def active_record_connection(spec)
-        require 'active_record'
+        require "active_record"
         ActiveRecordAdapter.new(spec)
       end
     end
@@ -12,61 +12,6 @@ module Vanity
     class ActiveRecordAdapter < AbstractAdapter
       # Base model, stores connection and defines schema
       class VanityRecord < ActiveRecord::Base
-        def self.define_schema
-          # Create a schema table to store the schema version
-          unless connection.tables.include?('vanity_schema')
-            connection.create_table :vanity_schema do |t|
-              t.integer :version
-            end
-          end
-
-          # Migrate
-          unless VanitySchema.find_by_version(1)
-            connection.create_table :vanity_metrics do |t|
-              t.string :metric_id
-              t.datetime :updated_at
-            end
-            connection.add_index :vanity_metrics, [:metric_id]
-
-            connection.create_table :vanity_metric_values do |t|
-              t.integer :vanity_metric_id
-              t.integer :index
-              t.integer :value
-              t.string :date
-            end
-            connection.add_index :vanity_metric_values, [:vanity_metric_id]
-
-            connection.create_table :vanity_experiments do |t|
-              t.string :experiment_id
-              t.integer :outcome
-              t.datetime :created_at
-              t.datetime :completed_at
-            end
-            connection.add_index :vanity_experiments, [:experiment_id]
-
-            connection.create_table :vanity_conversions do |t|
-              t.integer :vanity_experiment_id
-              t.integer :alternative
-              t.integer :conversions
-            end
-            connection.add_index :vanity_conversions, [:vanity_experiment_id, :alternative]
-
-            connection.create_table :vanity_participants do |t|
-              t.string :experiment_id
-              t.string :identity
-              t.integer :shown
-              t.integer :seen
-              t.integer :converted
-            end
-            connection.add_index :vanity_participants, [:experiment_id]
-            connection.add_index :vanity_participants, [:experiment_id, :identity]
-            connection.add_index :vanity_participants, [:experiment_id, :shown]
-            connection.add_index :vanity_participants, [:experiment_id, :seen]
-            connection.add_index :vanity_participants, [:experiment_id, :converted]
-
-            VanitySchema.create(:version => 1)
-          end
-        end
       end
 
       # Schema model
@@ -122,27 +67,21 @@ module Vanity
         # passed to create if creating, or will be used to
         # update the found participant.
         def self.retrieve(experiment, identity, create = true, update_with = nil)
-          record = VanityParticipant.first(
-                  :conditions =>
-                          {:experiment_id => experiment.to_s, :identity => identity})
-
-          if record
+          if record = VanityParticipant.first(:conditions=>{ :experiment_id=>experiment.to_s, :identity=>identity.to_s })
             record.update_attributes(update_with) if update_with
           elsif create
-            record = VanityParticipant.create(
-                    {:experiment_id => experiment.to_s,
-                     :identity => identity}.merge(update_with || {}))
+            record = VanityParticipant.create({ :experiment_id=>experiment.to_s, :identity=>identity }.merge(update_with || {}))
           end
-
           record
         end
       end
 
       def initialize(options)
-        options[:adapter] = options[:active_record_adapter] if options[:active_record_adapter]
-
-        VanityRecord.establish_connection(options)
-        VanityRecord.define_schema
+        @options = options.inject({}) { |h,kv| h[kv.first.to_s] = kv.last ; h }
+        if @options["active_record_adapter"] && (@options["active_record_adapter"] != "default")
+          @options["adapter"] = @options["active_record_adapter"]
+          VanityRecord.establish_connection(@options)
+        end
       end
 
       def active?
@@ -185,7 +124,7 @@ module Vanity
         dates = (from.to_date..to.to_date).map(&:to_s)
         conditions = [connection.quote_column_name('date') + ' IN (?)', dates]
         order = "#{connection.quote_column_name('date')}"
-        select = "sum(#{connection.quote_column_name('value')}) value, #{connection.quote_column_name('date')}"
+        select = "sum(#{connection.quote_column_name('value')}) AS value, #{connection.quote_column_name('date')}"
         group_by = "#{connection.quote_column_name('date')}"
 
         values = record.vanity_metric_values.all(
@@ -298,6 +237,10 @@ module Vanity
         VanityParticipant.delete_all(:experiment_id => experiment.to_s)
         record = VanityExperiment.find_by_experiment_id(experiment.to_s)
         record && record.destroy
+      end
+
+      def to_s
+        @options.to_s
       end
     end
   end

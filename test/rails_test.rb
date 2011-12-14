@@ -21,7 +21,21 @@ class UseVanityTest < ActionController::TestCase
     UseVanityController.class_eval do
       use_vanity :current_user
     end
+    if ::Rails.respond_to?(:application) # Rails 3 configuration
+      ::Rails.application.config.session_options[:domain] = '.foo.bar'
+    end
   end
+
+  def test_chooses_sets_alternatives_for_rails_tests
+    experiment(:pie_or_cake).chooses(true)
+    get :index
+    assert_equal 'true', @response.body
+ 
+    experiment(:pie_or_cake).chooses(false)
+    get :index
+    assert_equal 'false', @response.body
+  end
+
 
   def test_vanity_cookie_is_persistent
     get :index
@@ -71,7 +85,17 @@ class UseVanityTest < ActionController::TestCase
     get :index
     assert_equal "576", @controller.send(:vanity_identity)
   end
-
+  
+  def test_vanity_identity_set_with_indentity_paramater
+    get :index, :_identity => "id_from_params"
+    assert_equal "id_from_params", @controller.send(:vanity_identity)
+    
+    @request.cookies['vanity_id'] = "old_id"
+    get :index, :_identity => "id_from_params"
+    assert_equal "id_from_params", @controller.send(:vanity_identity)
+    assert cookies['vanity_id'], "id_from_params"
+  end
+  
   # query parameter filter
 
   def test_redirects_and_loses_vanity_query_parameter
@@ -81,22 +105,33 @@ class UseVanityTest < ActionController::TestCase
 
   def test_sets_choices_from_vanity_query_parameter
     first = experiment(:pie_or_cake).alternatives.first
-    # experiment(:pie_or_cake).fingerprint(first)
+    fingerprint = experiment(:pie_or_cake).fingerprint(first)
     10.times do
       @controller = nil ; setup_controller_request_and_response
-      get :index, :_vanity=>"aae9ff8081"
-      assert !experiment(:pie_or_cake).choose
+      get :index, :_vanity => fingerprint
+      assert_equal experiment(:pie_or_cake).choose, experiment(:pie_or_cake).alternatives.first
       assert experiment(:pie_or_cake).showing?(first)
     end
   end
 
   def test_does_nothing_with_vanity_query_parameter_for_posts
+    experiment(:pie_or_cake).chooses(experiment(:pie_or_cake).alternatives.last.value)
     first = experiment(:pie_or_cake).alternatives.first
-    post :index, :foo=>"bar", :_vanity=>"567"
+    fingerprint = experiment(:pie_or_cake).fingerprint(first)
+    post :index, :foo => "bar", :_vanity => fingerprint
     assert_response :success
     assert !experiment(:pie_or_cake).showing?(first)
   end
 
+  def test_track_param_tracks_a_metric
+    get :index, :_identity => "123", :_track => "sugar_high"
+    assert_equal experiment(:pie_or_cake).alternatives[0].converted, 1
+  end
+  
+  def test_cookie_domain_from_rails_configuration
+    get :index
+    assert_equal cookies["vanity_id"][:domain], '.foo.bar' if ::Rails.respond_to?(:application)
+  end
 
   # -- Load path --
 
@@ -160,6 +195,52 @@ $stdout << Vanity.playground.connection
     File.unlink "tmp/config/vanity.yml"
   end
 
+  def test_mongo_connection_from_yaml
+    FileUtils.mkpath "tmp/config"
+    File.open("tmp/config/vanity.yml", "w") do |io|
+      io.write <<-YML
+mongodb:
+  adapter: mongodb
+  host: localhost
+  port: 27017
+  database: vanity_test
+      YML
+    end
+
+    assert_equal "mongodb://localhost:27017/vanity_test", load_rails(<<-RB, "mongodb")
+initializer.after_initialize
+$stdout << Vanity.playground.connection
+    RB
+  ensure
+    File.unlink "tmp/config/vanity.yml"
+  end
+
+  def test_mongodb_replica_set_connection
+    FileUtils.mkpath "tmp/config"
+    File.open("tmp/config/vanity.yml", "w") do |io|
+      io.write <<-YML
+mongodb:
+  adapter: mongodb
+  hosts:
+    - localhost
+  port: 27017
+  database: vanity_test
+      YML
+    end
+
+    assert_equal "mongodb://localhost:27017/vanity_test", load_rails(<<-RB, "mongodb")
+initializer.after_initialize
+$stdout << Vanity.playground.connection
+    RB
+
+    assert_equal "Mongo::ReplSetConnection", load_rails(<<-RB, "mongodb")
+initializer.after_initialize
+$stdout << Vanity.playground.connection.mongo.class
+    RB
+  ensure
+    File.unlink "tmp/config/vanity.yml"
+  end
+
   def test_connection_from_yaml_url
     FileUtils.mkpath "tmp/config"
     ENV["RAILS_ENV"] = "production"
@@ -178,14 +259,13 @@ $stdout << Vanity.playground.connection
 
   def test_connection_from_yaml_missing
     FileUtils.mkpath "tmp/config"
-    ENV["RAILS_ENV"] = "development"
     File.open("tmp/config/vanity.yml", "w") do |io|
       io.write <<-YML
 production:
   adapter: redis
       YML
     end
-    assert_equal "No configuration for development", load_rails(<<-RB)
+    assert_equal "No configuration for development", load_rails(<<-RB, "development")
 initializer.after_initialize
 $stdout << (Vanity.playground.connection rescue $!.message)
     RB
@@ -214,7 +294,7 @@ $stdout << Vanity.playground.connection
   def test_connection_from_redis_yml
     FileUtils.mkpath "tmp/config"
     yml = File.open("tmp/config/redis.yml", "w")
-    yml << "development: internal.local:6379\n"
+    yml << "production: internal.local:6379\n"
     yml.flush
     assert_equal "redis://internal.local:6379/0", load_rails(<<-RB)
 initializer.after_initialize
@@ -222,6 +302,22 @@ $stdout << Vanity.playground.connection
     RB
   ensure
     File.unlink yml.path
+  end
+  
+  def test_collection_from_vanity_yaml
+    FileUtils.mkpath "tmp/config"
+    File.open("tmp/config/vanity.yml", "w") do |io|
+      io.write <<-YML
+production:
+  collecting: false
+      YML
+    end
+    assert_equal "false", load_rails(<<-RB)
+initializer.after_initialize
+$stdout << Vanity.playground.collecting?
+    RB
+  ensure
+    File.unlink "tmp/config/vanity.yml"
   end
 
   def test_collection_true_in_production_by_default
@@ -262,14 +358,13 @@ $stdout << Vanity.playground.collecting?
     RB
   end
 
-
   def load_rails(code, env = "production")
     tmp = Tempfile.open("test.rb")
     tmp.write <<-RB
 $:.delete_if { |path| path[/gems\\/vanity-\\d/] }
 $:.unshift File.expand_path("../lib")
 RAILS_ROOT = File.expand_path(".")
-RAILS_ENV = "#{env}"
+RAILS_ENV = ENV['RACK_ENV'] = "#{env}"
 require "initializer"
 require "active_support"
 Rails.configuration = Rails::Configuration.new

@@ -6,12 +6,11 @@ module Vanity
     # One of several alternatives in an A/B test (see AbTest#alternatives).
     class Alternative
 
-      def initialize(experiment, id, value, participants, converted, conversions)
+      def initialize(experiment, id, value) #, participants, converted, conversions)
         @experiment = experiment
         @id = id
         @name = "option #{(@id + 65).chr}"
         @value = value
-        @participants, @converted, @conversions = participants, converted, conversions
       end
 
       # Alternative id, only unique for this experiment.
@@ -27,13 +26,22 @@ module Vanity
       attr_reader :experiment
 
       # Number of participants who viewed this alternative.
-      attr_reader :participants
+      def participants
+        load_counts unless @participants
+        @participants
+      end
 
       # Number of participants who converted on this alternative (a participant is counted only once).
-      attr_reader :converted
+      def converted
+        load_counts unless @converted
+        @converted
+      end
 
       # Number of conversions for this alternative (same participant may be counted more than once).
-      attr_reader :conversions
+      def conversions
+        load_counts unless @conversions
+        @conversions
+      end
 
       # Z-score for this alternative, related to 2nd-best performing alternative. Populated by AbTest#score.
       attr_accessor :z_score
@@ -44,9 +52,9 @@ module Vanity
       # Difference from least performing alternative. Populated by AbTest#score.
       attr_accessor :difference
 
-      # Conversion rate calculated as converted/participants, rounded to 3 places.
+      # Conversion rate calculated as converted/participants
       def conversion_rate
-        @conversion_rate ||= (participants > 0 ? (converted.to_f/participants.to_f * 1000).round / 1000.0 : 0.0)
+        @conversion_rate ||= (participants > 0 ? converted.to_f/participants.to_f  : 0.0)
       end
 
       # The measure we use to order (sort) alternatives and decide which one is better (by calculating z-score).
@@ -71,25 +79,32 @@ module Vanity
         "#{name}: #{value} #{converted}/#{participants}"
       end
 
+      def load_counts
+        if @experiment.playground.collecting?
+          @participants, @converted, @conversions = @experiment.playground.connection.ab_counts(@experiment.id, id).values_at(:participants, :converted, :conversions)
+        else
+          @participants = @converted = @conversions = 0
+        end
+      end
     end
 
 
-    # The meat.
-    class AbTest < Base
-      class << self
+      # The meat.
+      class AbTest < Base
+        class << self
 
-        # Convert z-score to probability.
-        def probability(score)
-          score = score.abs
-          probability = AbTest::Z_TO_PROBABILITY.find { |z,p| score >= z }
-          probability ? probability.last : 0
+          # Convert z-score to probability.
+          def probability(score)
+            score = score.abs
+            probability = AbTest::Z_TO_PROBABILITY.find { |z,p| score >= z }
+            probability ? probability.last : 0
+          end
+
+          def friendly_name
+            "A/B Test" 
+          end
+
         end
-
-        def friendly_name
-          "A/B Test" 
-        end
-
-      end
 
       def initialize(*args)
         super
@@ -139,8 +154,7 @@ module Vanity
       def _alternatives
         alts = []
         @alternatives.each_with_index do |value, i|
-          counts = @playground.collecting? ? connection.ab_counts(@id, i) : Hash.new(0)
-          alts << Alternative.new(self, i, value, counts[:participants], counts[:converted], counts[:conversions])
+          alts << Alternative.new(self, i, value)
         end
         alts
       end
@@ -187,8 +201,10 @@ module Vanity
             index = connection.ab_showing(@id, identity)
             unless index
               index = alternative_for(identity)
-              connection.ab_add_participant @id, index, identity
-              check_completion!
+              if !@playground.using_js?
+                connection.ab_add_participant @id, index, identity
+                check_completion!
+              end
             end
           else
             index = connection.ab_get_outcome(@id) || alternative_for(identity)
@@ -197,8 +213,9 @@ module Vanity
           identity = identity()
           @showing ||= {}
           @showing[identity] ||= alternative_for(identity)
+          index = @showing[identity]
         end
-        @alternatives[index.to_i]
+        alternatives[index.to_i]
       end
 
       # Returns fingerprint (hash) for given alternative.  Can be used to lookup
@@ -233,8 +250,16 @@ module Vanity
             connection.ab_not_showing @id, identity
           else
             index = @alternatives.index(value)
+            #add them to the experiment unless they are already in it
+            unless index == connection.ab_showing(@id, identity)
+              connection.ab_add_participant @id, index, identity
+              check_completion!
+            end
             raise ArgumentError, "No alternative #{value.inspect} for #{name}" unless index
-            connection.ab_show @id, identity, index
+            if (connection.ab_showing(@id, identity) && connection.ab_showing(@id, identity) != index) || 
+         alternative_for(identity) != index
+              connection.ab_show @id, identity, index
+            end
           end
         else
           @showing ||= {}
@@ -247,7 +272,7 @@ module Vanity
       def showing?(alternative)
         identity = identity()
         if @playground.collecting?
-          connection.ab_showing(@id, identity) == alternative.id
+          (connection.ab_showing(@id, identity) || alternative_for(identity)) == alternative.id
         else
           @showing ||= {}
           @showing[identity] == alternative.id
@@ -379,9 +404,9 @@ module Vanity
         if @outcome_is
           begin
             result = @outcome_is.call
-            outcome = result.id if result && result.experiment == self
-          rescue
-            # TODO: logging
+            outcome = result.id if Alternative === result && result.experiment == self
+          rescue 
+            warn "Error in AbTest#complete!: #{$!}"
           end
         else
           best = score.best

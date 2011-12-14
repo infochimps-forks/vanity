@@ -16,7 +16,7 @@ module Vanity
     class RedisAdapter < AbstractAdapter
       def initialize(options)
         @options = options.clone
-        @options[:db] ||= @options[:database] || (@options[:path] && @options[:path].split("/")[1].to_i)
+        @options[:db] ||= @options[:database] || (@options[:path] && @options.delete(:path).split("/")[1].to_i)
         @options[:thread_safe] = true
         connect!
       end
@@ -26,7 +26,13 @@ module Vanity
       end
 
       def disconnect!
-        @redis.quit rescue nil if @redis
+        if redis
+          begin
+            redis.client.disconnect
+          rescue Exception => e
+            warn("Error while disconnecting from redis: #{e.message}")
+          end
+        end
         @redis = nil
       end
 
@@ -42,7 +48,7 @@ module Vanity
       end
 
       def to_s
-        @redis.id
+        redis.id
       end
 
       def redis

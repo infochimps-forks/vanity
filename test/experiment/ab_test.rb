@@ -118,6 +118,21 @@ class AbTestTest < ActionController::TestCase
     assert_equal 1, experiment(:abcd).alternatives.sum(&:conversions)
   end
 
+  # -- use_js! --
+
+  def test_does_not_record_participant_when_using_js
+    Vanity.playground.use_js!
+    ids = (0...10).to_a
+    new_ab_test :foobar do
+      alternatives "foo", "bar"
+      identify { ids.pop }
+      metrics :coolness
+    end
+    10.times { experiment(:foobar).choose }
+    alts = experiment(:foobar).alternatives
+    assert_equal 0, alts.map(&:participants).sum
+  end
+
 
   # -- Running experiment --
 
@@ -127,10 +142,10 @@ class AbTestTest < ActionController::TestCase
       identify { "6e98ec" }
       metrics :coolness
     end
-    assert value = experiment(:foobar).choose
+    assert value = experiment(:foobar).choose.value
     assert_match /foo|bar/, value
     1000.times do
-      assert_equal value, experiment(:foobar).choose
+      assert_equal value, experiment(:foobar).choose.value
     end
   end
 
@@ -140,7 +155,7 @@ class AbTestTest < ActionController::TestCase
       identify { rand }
       metrics :coolness
     end
-    alts = Array.new(1000) { experiment(:foobar).choose }
+    alts = Array.new(1000) { experiment(:foobar).choose.value }
     assert_equal %w{bar foo}, alts.uniq.sort
     assert_in_delta alts.select { |a| a == "foo" }.size, 500, 100 # this may fail, such is propability
   end
@@ -324,7 +339,7 @@ class AbTestTest < ActionController::TestCase
     fake :abcd, :a=>[182, 35], :b=>[180, 45], :c=>[189,28], :d=>[188, 61]
 
     z_scores = experiment(:abcd).score.alts.map { |alt| "%.2f" % alt.z_score }
-    assert_equal %w{-1.33 0.00 -2.47 1.58}, z_scores
+    assert_equal %w{-1.33 0.00 -2.46 1.58}, z_scores
     probabilities = experiment(:abcd).score.alts.map(&:probability)
     assert_equal [90, 0, 99, 90], probabilities
 
@@ -466,7 +481,7 @@ Option C did not convert.
 
     assert_equal <<-TEXT, experiment(:abcd).conclusion.join("\n") << "\n"
 There are 374 participants in this experiment.
-The best choice is option D: it converted at 32.4%.
+The best choice is option D: it converted at 32.4% (1% better than option B).
 This result is not statistically significant, suggest you continue this experiment.
 Option B converted at 32.3%.
 Option A did not convert.
@@ -530,7 +545,7 @@ This experiment did not run long enough to find a clear winner.
   def test_completion_if_fails
     new_ab_test :simple do
       identify { rand }
-      complete_if { fail }
+      complete_if { fail "Testing complete_if raises exception" }
       metrics :coolness
     end
     experiment(:simple).choose
@@ -564,7 +579,7 @@ This experiment did not run long enough to find a clear winner.
     # Run experiment to completion (100 participants)
     results = Set.new
     100.times do
-      results << experiment(:simple).choose
+      results << experiment(:simple).choose.value
       metric(:coolness).track!
     end
     assert results.include?(true) && results.include?(false)
@@ -572,7 +587,7 @@ This experiment did not run long enough to find a clear winner.
 
     # Test that we always get the same choice (true)
     100.times do
-      assert_equal true, experiment(:simple).choose
+      assert_equal true, experiment(:simple).choose.value
       metric(:coolness).track!
     end
     # We don't get to count the 100 participant's conversion, but that's ok.
@@ -590,6 +605,18 @@ This experiment did not run long enough to find a clear winner.
     end
     experiment(:quick).complete!
     assert_equal experiment(:quick).alternatives[1], experiment(:quick).outcome
+  end
+
+  def test_error_in_completion
+    new_ab_test :quick do
+      outcome_is { raise RuntimeError }
+      metrics :coolness
+    end
+    e = experiment(:quick)
+    e.expects(:warn)
+    assert_nothing_raised do
+      e.complete!
+    end
   end
 
   def test_outcome_is_returns_nil
@@ -612,7 +639,7 @@ This experiment did not run long enough to find a clear winner.
 
   def test_outcome_is_fails
     new_ab_test :quick do
-      outcome_is { fail }
+      outcome_is { fail "Testing outcome_is raising exception" }
       metrics :coolness
     end
     experiment(:quick).complete!
@@ -669,10 +696,53 @@ This experiment did not run long enough to find a clear winner.
     assert_nil experiment(:quick).outcome
   end
 
+  def test_chooses_records_participants
+    new_ab_test :simple do
+      alternatives :a, :b, :c
+      metrics :coolness
+    end
+    experiment(:simple).chooses(:b)
+    assert_equal experiment(:simple).alternatives[1].participants, 1
+  end
+
+  def test_chooses_moves_participant_to_new_alternative
+    new_ab_test :simple do
+      alternatives :a, :b, :c
+      metrics :coolness
+      identify { "1" }
+    end
+    val = experiment(:simple).choose.value
+    alternative = experiment(:simple).alternatives.detect {|a| a.value != val }
+    experiment(:simple).chooses(alternative.value)
+    assert_equal experiment(:simple).choose.value, alternative.value
+    experiment(:simple).chooses(val)
+    assert_equal experiment(:simple).choose.value, val
+  end
+
+  def test_chooses_records_participants_only_once
+    new_ab_test :simple do
+      alternatives :a, :b, :c
+      metrics :coolness
+    end
+    2.times { experiment(:simple).chooses(:b) }
+    assert_equal experiment(:simple).alternatives[1].participants, 1
+  end
+
+  def test_chooses_records_participants_for_new_alternatives
+    new_ab_test :simple do
+      alternatives :a, :b, :c
+      metrics :coolness
+    end
+    experiment(:simple).chooses(:b)
+    experiment(:simple).chooses(:c)
+    assert_equal experiment(:simple).alternatives[2].participants, 1
+  end
+
   def test_no_collection_and_chooses
     not_collecting!
     new_ab_test :simple do
       alternatives :a, :b, :c
+      metrics :coolness
     end
     assert !experiment(:simple).showing?(experiment(:simple).alternatives[1])
     experiment(:simple).chooses(:b)
@@ -684,10 +754,11 @@ This experiment did not run long enough to find a clear winner.
     not_collecting!
     new_ab_test :simple do
       alternatives :a, :b, :c
+      metrics :coolness
     end
-    choice = experiment(:simple).choose
+    choice = experiment(:simple).choose.value
     assert [:a, :b, :c].include?(choice)
-    assert_equal choice, experiment(:simple).choose
+    assert_equal choice, experiment(:simple).choose.value
   end
 
 

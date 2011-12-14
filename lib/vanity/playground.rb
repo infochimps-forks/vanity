@@ -10,6 +10,7 @@ module Vanity
   class Playground
 
     DEFAULTS = { :collecting => true, :load_path=>"experiments" }
+    DEFAULT_ADD_PARTICIPANT_PATH = '/vanity/add_participant'
 
     # Created new Playground. Unless you need to, use the global
     # Vanity.playground.
@@ -21,16 +22,34 @@ module Vanity
     # - load_path -- Path to load experiments/metrics from
     # - logger -- Logger to use
     def initialize(*args)
-      options = args.pop if Hash === args.last
-      @options = DEFAULTS.merge(options || {})
-      if @options.values_at(:host, :port, :db).any?
+      options = Hash === args.last ? args.pop : {}
+      # In the case of Rails, use the Rails logger and collect only for
+      # production environment by default.
+      defaults = options[:rails] ? DEFAULTS.merge(:collecting => ::Rails.env.production?, :logger => ::Rails.logger) : DEFAULTS
+      if config_file_exists?
+        env = ENV["RACK_ENV"] || ENV["RAILS_ENV"] || "development"
+        config = load_config_file[env]
+        if Hash === config
+          config = config.inject({}) { |h,kv| h[kv.first.to_sym] = kv.last ; h }
+        else
+          config = { :connection=>config }
+        end
+      else
+        config = {}
+      end
+
+      @options = defaults.merge(config).merge(options)
+      if @options[:host] == 'redis' && @options.values_at(:host, :port, :db).any?
         warn "Deprecated: please specify Redis connection as URL (\"redis://host:port/db\")"
-        establish_connection :adapter=>"redis", :host=>options[:host], :port=>options[:port], :database=>options[:db]
+        establish_connection :adapter=>"redis", :host=>@options[:host], :port=>@options[:port], :database=>@options[:db] || @options[:database]
       elsif @options[:redis]
         @adapter = RedisAdapter.new(:redis=>@options[:redis])
       else
         connection_spec = args.shift || @options[:connection]
-        establish_connection "redis://" + connection_spec if connection_spec
+        if connection_spec
+          connection_spec = "redis://" + connection_spec unless connection_spec[/^\w+:/]
+          establish_connection connection_spec
+        end
       end
 
       warn "Deprecated: namespace option no longer supported directly" if @options[:namespace]
@@ -40,7 +59,9 @@ module Vanity
         @logger.level = Logger::ERROR
       end
       @loading = []
-      @collecting = @options[:collecting]
+      @use_js = false
+      self.add_participant_path = DEFAULT_ADD_PARTICIPANT_PATH
+      @collecting = !!@options[:collecting]
     end
    
     # Deprecated. Use redis.server instead.
@@ -51,6 +72,9 @@ module Vanity
 
     # Logger.
     attr_accessor :logger
+
+    # Path to the add_participant action, necessary if you have called use_js!
+    attr_accessor :add_participant_path
 
     # Defines a new experiment. Generally, do not call this directly,
     # use one of the definition methods (ab_test, measure, etc).
@@ -77,6 +101,34 @@ module Vanity
       experiments[id.to_sym] or raise NameError, "No experiment #{id}"
     end
 
+
+    # -- Robot Detection --
+
+    # Call to indicate that participants should be added via js
+    # This helps keep robots from participating in the ab test
+    # and skewing results.
+    #
+    # If you use this, there are two more steps:
+    # - Set Vanity.playground.add_participant_path = '/path/to/vanity/action',
+    #   this should point to the add_participant path that is added with
+    #   Vanity::Rails::Dashboard, make sure that this action is available
+    #   to all users
+    # - Add <%= vanity_js %> to any page that needs uses an ab_test. vanity_js
+    #   needs to be included after your call to ab_test so that it knows which
+    #   version of the experiment the participant is a member of.  The helper
+    #   will render nothing if the there are no ab_tests running on the current
+    #   page, so adding vanity_js to the bottom of your layouts is a good
+    #   option.  Keep in mind that if you call use_js! and don't include
+    #   vanity_js in your view no participants will be recorded.
+    def use_js!
+      @use_js = true
+    end
+
+    def using_js?
+      @use_js
+    end
+
+
     # Returns hash of experiments (key is experiment id).
     #
     # @see Vanity::Experiment
@@ -85,7 +137,8 @@ module Vanity
         @experiments = {}
         @logger.info "Vanity: loading experiments from #{load_path}"
         Dir[File.join(load_path, "*.rb")].each do |file|
-          Experiment::Base.load self, @loading, file
+          experiment = Experiment::Base.load(self, @loading, file)
+          experiment.save
         end
       end
       @experiments
@@ -141,7 +194,7 @@ module Vanity
         Dir[File.join(load_path, "metrics/*.rb")].each do |file|
           Metric.load self, @loading, file
         end
-        if File.exist?("config/vanity.yml") && remote = YAML.load(ERB.new(File.read("config/vanity.yml")).result)["metrics"]
+        if config_file_exists? && remote = load_config_file["metrics"]
           remote.each do |id, url|
             fail "Metric #{id} already defined in playground" if metrics[id.to_sym]
             metric = Metric.new(self, id)
@@ -190,24 +243,25 @@ module Vanity
     #
     # @since 1.4.0 
     def establish_connection(spec = nil)
+      @spec = spec
       disconnect! if @adapter
       case spec
       when nil
-        if File.exists?("config/vanity.yml")
+        if config_file_exists?
           env = ENV["RACK_ENV"] || ENV["RAILS_ENV"] || "development"
-          spec = YAML.load(ERB.new(File.read("config/vanity.yml")).result)[env]
+          spec = load_config_file[env]
           fail "No configuration for #{env}" unless spec
           establish_connection spec
-        elsif File.exists?("config/redis.yml")
+        elsif config_file_exists?("redis.yml")
           env = ENV["RACK_ENV"] || ENV["RAILS_ENV"] || "development"
-          redis = YAML.load(ERB.new(File.read("config/redis.yml")).result)[env]
+          redis = load_config_file("redis.yml")[env]
           fail "No configuration for #{env}" unless redis
           establish_connection "redis://" + redis
         else
           establish_connection :adapter=>"redis"
         end
       when Symbol
-        spec = YAML.load(ERB.new(File.read("config/vanity.yml")).result)[spec.to_s]
+        spec = load_config_file[spec.to_s]
         establish_connection spec
       when String
         uri = URI.parse(spec)
@@ -216,13 +270,20 @@ module Vanity
           :host=>uri.host, :port=>uri.port, :path=>uri.path, :params=>params
       else
         spec = spec.inject({}) { |hash,(k,v)| hash[k.to_sym] = v ; hash }
-        begin
-          require "vanity/adapters/#{spec[:adapter]}_adapter"
-        rescue LoadError
-          raise "Could not find #{spec[:adapter]} in your load path"
-        end
         @adapter = Adapters.establish_connection(spec)
       end
+    end
+
+    def config_file_root
+      (defined?(::Rails) ? ::Rails.root : Pathname.new(".")) + "config"
+    end
+
+    def config_file_exists?(basename = "vanity.yml")
+      File.exists?(config_file_root + basename)
+    end
+
+    def load_config_file(basename = "vanity.yml")
+      YAML.load(ERB.new(File.read(config_file_root + basename)).result)
     end
 
     # Returns the current connection. Establishes new connection is necessary.
@@ -250,7 +311,7 @@ module Vanity
     #
     # @since 1.3.0
     def reconnect!
-      establish_connection
+      establish_connection(@spec)
     end
 
     # Deprecated. Use Vanity.playground.collecting = true/false instead.  Under
@@ -285,13 +346,17 @@ module Vanity
 
   # In the case of Rails, use the Rails logger and collect only for
   # production environment by default.
-  @playground = Playground.new(defined?(Rails) ? { :logger => Rails.logger, :collecting => Rails.env.production? } : {})  
   class << self
 
     # The playground instance.
     #
     # @see Vanity::Playground
     attr_accessor :playground
+    def playground
+      # In the case of Rails, use the Rails logger and collect only for
+      # production environment by default.
+      @playground ||= Playground.new(:rails=>defined?(::Rails))
+    end
 
     # Returns the Vanity context.  For example, when using Rails this would be
     # the current controller, which can be used to get/set the vanity identity.
@@ -311,7 +376,6 @@ module Vanity
       path << ".erb" unless name["."]
       path
     end
-
   end
 end
 

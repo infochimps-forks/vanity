@@ -8,7 +8,7 @@ class PassengerTest < Test::Unit::TestCase
     @original = Vanity.playground.connection
     File.unlink "test/myapp/config/vanity.yml" rescue nil
     File.open("test/myapp/config/vanity.yml", "w") do |io|
-      io.write "production: #{Vanity.playground.connection}"
+      io.write YAML.dump({ "production"=>DATABASE })
     end
     @server = PhusionPassenger::SpawnManager.new
     @server.start
